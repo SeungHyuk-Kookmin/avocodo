@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-
-# Copyright 2020 Jungil Kong
-#  MIT License (https://opensource.org/licenses/MIT)
-
-"""."""
-'''
-Copied from https://github.com/jik876/hifi-gan/blob/master/meldataset.py
-'''
-
+# HiFi-GAN에서 가져온 MelDataset 모듈
 
 import math
 import os
@@ -19,44 +11,44 @@ from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
 
-MAX_WAV_VALUE = 32768.0
+MAX_WAV_VALUE = 32768.0   # 16-bit PCM 정규화 상수
 
 
+# wav 파일 로드
 def load_wav(full_path):
-    sampling_rate, data = read(full_path)
+    sampling_rate, data = read(full_path)  # scipy로 읽기
     return data, sampling_rate
 
 
+# ===== Dynamic Range Compression / Decompression =====
+# (log/exp 스케일링 → magnitude 안정화)
 def dynamic_range_compression(x, C=1, clip_val=1e-5):
     return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
-
 
 def dynamic_range_decompression(x, C=1):
     return np.exp(x) / C
 
-
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
     return torch.log(torch.clamp(x, min=clip_val) * C)
-
 
 def dynamic_range_decompression_torch(x, C=1):
     return torch.exp(x) / C
 
 
+# ===== Spectral Normalize / De-Normalize =====
 def spectral_normalize_torch(magnitudes):
-    output = dynamic_range_compression_torch(magnitudes)
-    return output
-
+    return dynamic_range_compression_torch(magnitudes)
 
 def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
+    return dynamic_range_decompression_torch(magnitudes)
 
 
+# 캐시 딕셔너리 (device, fmax별로 mel basis & window 저장)
 mel_basis = {}
 hann_window = {}
 
 
+# 멜 스펙트로그램 계산
 def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
     if torch.min(y) < -1.:
         print('min value is ', torch.min(y))
@@ -64,31 +56,34 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
+    # mel basis 캐싱 (fmax + device 조합별로 저장)
     if fmax not in mel_basis:
         mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
         mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
+    # padding (STFT 중심 맞추기용)
     y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
     y = y.squeeze(1)
 
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
-    spec = torch.view_as_real(spec)
+    # STFT 변환
+    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size,
+                      window=hann_window[str(y.device)], center=center,
+                      pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
+    spec = torch.view_as_real(spec)   # complex → real+imag
 
+    # magnitude
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
+    # mel basis 곱하기
     spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
-    spec = spectral_normalize_torch(spec)
+    spec = spectral_normalize_torch(spec)   # 로그 스케일 normalize
 
     return spec
 
 
-def get_dataset_filelist(
-    input_wavs_dir,
-    input_training_file,
-    input_validation_file
-):
+# train/val 파일 리스트 불러오기
+def get_dataset_filelist(input_wavs_dir, input_training_file, input_validation_file):
     with open(input_training_file, 'r', encoding='utf-8') as fi:
         training_files = [os.path.join(input_wavs_dir, x.split('|')[0] + '.wav')
                           for x in fi.read().split('\n') if len(x) > 0]
@@ -99,14 +94,18 @@ def get_dataset_filelist(
     return training_files, validation_files
 
 
+# ===== MelDataset 정의 =====
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self, training_files, segment_size, n_fft, num_mels,
-                 hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
+                 hop_size, win_size, sampling_rate, fmin, fmax, 
+                 split=True, shuffle=True, n_cache_reuse=1,
                  fmax_loss=None, fine_tuning=False, base_mels_path=None):
+
         self.audio_files = training_files
         random.seed(1234)
         if shuffle:
             random.shuffle(self.audio_files)
+
         self.segment_size = segment_size
         self.sampling_rate = sampling_rate
         self.split = split
@@ -117,32 +116,39 @@ class MelDataset(torch.utils.data.Dataset):
         self.fmin = fmin
         self.fmax = fmax
         self.fmax_loss = fmax_loss
+
+        # 캐싱 관련 변수
         self.cached_wav = None
         self.n_cache_reuse = n_cache_reuse
         self._cache_ref_count = 0
+
+        # 파인튜닝 여부
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
+
+        # wav 캐시 사용 or 새로 로드
         if self._cache_ref_count == 0:
             audio, sampling_rate = load_wav(filename)
             audio = audio / MAX_WAV_VALUE
             if not self.fine_tuning:
-                audio = normalize(audio) * 0.95
+                audio = normalize(audio) * 0.95   # 정규화
             self.cached_wav = audio
             if sampling_rate != self.sampling_rate:
-                raise ValueError("{} SR doesn't match target {} SR".format(
-                    sampling_rate, self.sampling_rate))
+                raise ValueError(f"{sampling_rate} SR doesn't match target {self.sampling_rate} SR")
             self._cache_ref_count = self.n_cache_reuse
         else:
             audio = self.cached_wav
             self._cache_ref_count -= 1
 
-        audio = torch.FloatTensor(audio)
-        audio = audio.unsqueeze(0)
+        # torch tensor 변환
+        audio = torch.FloatTensor(audio).unsqueeze(0)   # [1, T]
 
+        # ===== Fine-tuning 여부에 따른 분기 =====
         if not self.fine_tuning:
+            # (1) Normal 학습 모드: mel on-the-fly
             if self.split:
                 if audio.size(1) >= self.segment_size:
                     max_audio_start = audio.size(1) - self.segment_size
@@ -152,14 +158,15 @@ class MelDataset(torch.utils.data.Dataset):
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
             mel = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                  self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
-                                  center=False)
+                                  self.sampling_rate, self.hop_size, self.win_size,
+                                  self.fmin, self.fmax, center=False)
         else:
+            # (2) Fine-tuning 모드: 미리 계산된 mel 로드
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
             mel = torch.from_numpy(mel)
 
-            if len(mel.shape) < 3:
+            if len(mel.shape) < 3:   # [C, T] → [1, C, T]
                 mel = mel.unsqueeze(0)
 
             if self.split:
@@ -173,10 +180,12 @@ class MelDataset(torch.utils.data.Dataset):
                     mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
 
+        # ===== mel for loss (fmax_loss 버전) =====
         mel_loss = mel_spectrogram(audio, self.n_fft, self.num_mels,
-                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax_loss,
-                                   center=False)
+                                   self.sampling_rate, self.hop_size, self.win_size,
+                                   self.fmin, self.fmax_loss, center=False)
 
+        # 반환: (mel, audio, filename, mel_loss)
         return (mel.squeeze(), audio.squeeze(0), filename, mel_loss.squeeze())
 
     def __len__(self):
